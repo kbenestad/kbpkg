@@ -1,11 +1,13 @@
 on: [push]
-  ...
-      steps:
-        - uses: actions/checkout@v3
-          with:
-            fetch-depth: 0
-        - uses: yesolutions/mirror-action@master
-          with:
-            REMOTE: 'https://codeberg.org/kbpkg/kbpkg.git'
-            GIT_USERNAME: kbenestad
-            GIT_PASSWORD: ${{ secrets.GIT_PASSWORD }}
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - uses: yesolutions/mirror-action@master
+        with:
+          REMOTE: 'https://codeberg.org/kbpkg/kbpkg.git'
+          GIT_USERNAME: kbenestad
+          GIT_PASSWORD: ${{ secrets.GIT_PASSWORD }}

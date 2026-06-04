@@ -1,0 +1,12 @@
+name: myproject
+description: Short description of the project
+version: 0.1.0
+type: web
+author: kbenestad
+license: MIT
+urls:
+  dev: https://codeberg.org/kbenestad/myproject
+  docs: https://docs.example.com/myproject
+  website: https://myproject.example.com
+breakingchanges: no
+breakingmessage: ""

@@ -153,6 +153,16 @@ except: pass
   fi
 }
 
+# --- source URL helpers ---
+
+_parse_source_host() {
+  echo "$1" | sed 's|https://||' | cut -d'/' -f1
+}
+
+_parse_source_org() {
+  echo "$1" | sed 's|https://[^/]*/||'
+}
+
 # --- try cloning from source list ---
 
 _try_clone() {
@@ -631,6 +641,155 @@ cmd_uninstall() {
   echo "kbpkg removed. Open a new terminal to complete uninstall."
 }
 
+cmd_packages() {
+  local found=0
+  for source in "${SOURCES[@]}"; do
+    local host org repos_json
+    host=$(_parse_source_host "$source")
+    org=$(_parse_source_org "$source")
+
+    if [ "$host" = "github.com" ]; then
+      repos_json=$(curl -fsSL "https://api.github.com/orgs/$org/repos?per_page=100" 2>/dev/null)
+    else
+      repos_json=$(curl -fsSL "https://$host/api/v1/orgs/$org/repos?limit=50" 2>/dev/null)
+    fi
+
+    [ -z "$repos_json" ] && continue
+
+    local output
+    output=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    if not isinstance(data, list) or not data:
+        sys.exit(1)
+    fmt = '{:<25} {}'
+    print(fmt.format('NAME', 'DESCRIPTION'))
+    print('-' * 70)
+    for r in sorted(data, key=lambda x: x.get('name', '')):
+        name = r.get('name', '')
+        desc = r.get('description', '') or ''
+        if name:
+            print(fmt.format(name, desc))
+except Exception:
+    sys.exit(1)
+" "$repos_json" 2>/dev/null)
+
+    if [ $? -eq 0 ] && [ -n "$output" ]; then
+      echo "Available packages from $source:"
+      echo ""
+      echo "$output"
+      found=1
+      break
+    fi
+  done
+
+  if [ "$found" -eq 0 ]; then
+    echo "Error: Could not retrieve package list. Check your internet connection."
+    return 1
+  fi
+}
+
+cmd_details() {
+  local reponame="$1"
+
+  if [ -z "$reponame" ]; then
+    echo "Usage: kbpkg details REPONAME"
+    return 1
+  fi
+
+  local found=0
+  for source in "${SOURCES[@]}"; do
+    local host org repo_json kbpkg_raw
+    host=$(_parse_source_host "$source")
+    org=$(_parse_source_org "$source")
+
+    if [ "$host" = "github.com" ]; then
+      repo_json=$(curl -fsSL "https://api.github.com/repos/$org/$reponame" 2>/dev/null)
+      kbpkg_raw=$(curl -fsSL "https://raw.githubusercontent.com/$org/$reponame/main/kbpkg.yml" 2>/dev/null)
+    else
+      repo_json=$(curl -fsSL "https://$host/api/v1/repos/$org/$reponame" 2>/dev/null)
+      kbpkg_raw=$(curl -fsSL "https://$host/$org/$reponame/raw/branch/main/kbpkg.yml" 2>/dev/null)
+    fi
+
+    local valid
+    valid=$(python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    print('yes' if 'name' in d else 'no')
+except:
+    print('no')
+" "$repo_json" 2>/dev/null)
+
+    [ "$valid" != "yes" ] && continue
+
+    found=1
+
+    python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+name      = d.get('name', '')
+desc      = d.get('description', '') or '(none)'
+stars     = d.get('stars_count', d.get('stargazers_count', 0))
+forks     = d.get('forks_count', 0)
+updated   = (d.get('updated', '') or d.get('updated_at', ''))[:10]
+clone_url = d.get('clone_url', '')
+topics    = d.get('topics', [])
+print(f'Name:         {name}')
+print(f'Description:  {desc}')
+print(f'Stars:        {stars}')
+print(f'Forks:        {forks}')
+print(f'Last updated: {updated}')
+print(f'Clone URL:    {clone_url}')
+if topics:
+    print(f'Topics:       {\", \".join(topics)}')
+" "$repo_json"
+
+    if [ -n "$kbpkg_raw" ] && echo "$kbpkg_raw" | grep -q '^version:'; then
+      echo ""
+      echo "Package info:"
+      local version type docs breaking
+      version=$(echo "$kbpkg_raw" | grep '^version:'          | awk '{print $2}'           | tr -d '"')
+      type=$(echo    "$kbpkg_raw" | grep '^type:'             | awk '{print $2}'           | tr -d '"')
+      docs=$(echo    "$kbpkg_raw" | grep '^docs:'             | sed 's/^docs: *//'         | tr -d '"')
+      breaking=$(echo "$kbpkg_raw" | grep '^breakingchanges:' | awk '{print $2}'           | tr -d '"')
+      [ -n "$version"  ]                          && echo "  Version:  $version"
+      [ -n "$type"     ]                          && echo "  Type:     $type"
+      [ -n "$docs"     ]                          && echo "  Docs:     $docs"
+      [ -n "$breaking" ] && [ "$breaking" != "no" ] && echo "  Breaking changes flagged"
+    fi
+
+    echo ""
+    local installed_entry
+    installed_entry=$(python3 -c "
+import json, sys
+data = json.load(open('$STATE_FILE'))
+for p in data['packages']:
+    if p['name'] == sys.argv[1]:
+        print(json.dumps(p))
+        break
+" "$reponame" 2>/dev/null)
+
+    if [ -n "$installed_entry" ]; then
+      local inst_version inst_localname inst_path
+      inst_version=$(python3  -c "import json,sys; print(json.loads(sys.argv[1]).get('version',''))"   "$installed_entry")
+      inst_localname=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('localname',''))" "$installed_entry")
+      inst_path=$(python3     -c "import json,sys; print(json.loads(sys.argv[1]).get('path',''))"      "$installed_entry")
+      echo "Installed:    yes — $inst_localname v$inst_version at $inst_path"
+    else
+      echo "Installed:    no"
+    fi
+
+    break
+  done
+
+  if [ "$found" -eq 0 ]; then
+    echo "Error: Could not find '$reponame' in any source."
+    return 1
+  fi
+}
+
 _check_version() {
   local remote
   remote=$(curl -fsSL "$KBPKG_UPDATE_URL" 2>/dev/null | tr -d '[:space:]')
@@ -650,14 +809,16 @@ kbpkg() {
   local cmd="$1"
   shift
   case "$cmd" in
-    install) cmd_install "$@" ;;
-    update)  cmd_update "$@" ;;
-    run)     cmd_run "$@" ;;
-    list)    cmd_list ;;
-    remove)  cmd_remove "$@" ;;
-    clean)     cmd_clean ;;
-    upgrade)   cmd_upgrade ;;
+    install)  cmd_install "$@" ;;
+    update)   cmd_update "$@" ;;
+    run)      cmd_run "$@" ;;
+    list)     cmd_list ;;
+    remove)   cmd_remove "$@" ;;
+    clean)    cmd_clean ;;
+    upgrade)  cmd_upgrade ;;
     uninstall) cmd_uninstall ;;
+    packages) cmd_packages ;;
+    details)  cmd_details "$@" ;;
     *)
       _check_version
       echo "kbpkg - package manager"
@@ -669,8 +830,10 @@ kbpkg() {
       echo "  list                          List installed packages"
       echo "  remove LOCALNAME [-y]         Remove a package"
       echo "  clean                         Remove stale state entries"
-  echo "  upgrade                       Upgrade kbpkg to the latest version"
-  echo "  uninstall                     Remove kbpkg from this machine"
+      echo "  upgrade                       Upgrade kbpkg to the latest version"
+      echo "  uninstall                     Remove kbpkg from this machine"
+      echo "  packages                      List all available packages from sources"
+      echo "  details REPONAME              Show metadata for a package"
       ;;
   esac
 }

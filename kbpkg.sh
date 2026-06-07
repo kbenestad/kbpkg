@@ -625,22 +625,95 @@ cmd_run() {
   python3 -m http.server 8000 --directory "$path"
 }
 
+_fetch_latest_version() {
+  local pkg_type="$1"
+  local path="$2"
+  local source="$3"
+  local remote_yml=""
+
+  if [ "$pkg_type" = "binary" ]; then
+    local host
+    host=$(echo "$source" | sed 's|https://||' | cut -d'/' -f1)
+    if echo "$host" | grep -q "github.com"; then
+      local slug
+      slug=$(echo "$source" | sed 's|https://github.com/||')
+      remote_yml=$(curl -fsSL "https://raw.githubusercontent.com/$slug/main/kbpkg.yml" 2>/dev/null)
+      [ -z "$remote_yml" ] && remote_yml=$(curl -fsSL "https://raw.githubusercontent.com/$slug/master/kbpkg.yml" 2>/dev/null)
+    else
+      remote_yml=$(curl -fsSL "$source/raw/branch/main/kbpkg.yml" 2>/dev/null)
+      [ -z "$remote_yml" ] && remote_yml=$(curl -fsSL "$source/raw/branch/master/kbpkg.yml" 2>/dev/null)
+    fi
+  else
+    if [ -d "$path/.git" ]; then
+      git -C "$path" fetch --quiet 2>/dev/null
+      remote_yml=$(git -C "$path" show FETCH_HEAD:kbpkg.yml 2>/dev/null)
+    fi
+  fi
+
+  echo "$remote_yml" | grep '^version:' | awk '{print $2}' | tr -d '"'
+}
+
 cmd_list() {
   _check_version
-  python3 -c "
+
+  local packages
+  packages=$(python3 -c "
 import json
 data = json.load(open('$STATE_FILE'))
-if not data['packages']:
-    print('No packages installed.')
-else:
-    fmt = '{:<20} {:<12} {:<10} {:<10} {}'
-    print(fmt.format('NAME', 'LOCALNAME', 'VERSION', 'TYPE', 'PATH'))
-    print('-' * 80)
-    for p in data['packages']:
-        pkg_type = p.get('type', 'web')
-        path_label = p['path'] if pkg_type != 'binary' else p['path']
-        print(fmt.format(p['name'], p['localname'], p['version'], pkg_type, path_label))
-"
+import json as j
+for p in data['packages']:
+    print(j.dumps(p))
+")
+
+  if [ -z "$packages" ]; then
+    echo "No packages installed."
+    return
+  fi
+
+  local -A latest_map
+  echo "Checking for updates..." >&2
+  while IFS= read -r entry_json; do
+    local localname pkg_type path source latest
+    localname=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['localname'])" "$entry_json")
+    pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry_json")
+    path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry_json")
+    source=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['source'])" "$entry_json")
+    latest=$(_fetch_latest_version "$pkg_type" "$path" "$source")
+    latest_map["$localname"]="${latest:-unknown}"
+  done <<< "$packages"
+
+  local outdated=0
+  local fmt='{:<20} {:<12} {:<12} {:<12} {:<10} {}'
+  python3 - <<PYEOF
+import json, sys
+data = json.load(open('$STATE_FILE'))
+fmt = '{:<20} {:<12} {:<12} {:<12} {:<10} {}'
+print(fmt.format('NAME', 'LOCALNAME', 'INSTALLED', 'LATEST', 'TYPE', 'PATH'))
+print('-' * 96)
+latest_map = {}
+PYEOF
+
+  while IFS= read -r entry_json; do
+    local localname installed latest pkg_type path
+    localname=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['localname'])" "$entry_json")
+    installed=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$entry_json")
+    pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry_json")
+    path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry_json")
+    latest="${latest_map[$localname]:-unknown}"
+    local marker=""
+    if [ "$latest" != "unknown" ] && [ "$installed" != "unknown" ] && [ "$latest" != "$installed" ]; then
+      marker=" *"
+      outdated=1
+    fi
+    printf '%-20s %-12s %-12s %-12s %-10s %s%s\n' \
+      "$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['name'])" "$entry_json")" \
+      "$localname" "$installed" "$latest$marker" "$pkg_type" "$path"
+  done <<< "$packages"
+
+  if [ "$outdated" -eq 1 ]; then
+    echo ""
+    echo "You have one or more outdated packages. You can update them by running \`kbpkg update\`."
+  fi
 }
 
 cmd_remove() {

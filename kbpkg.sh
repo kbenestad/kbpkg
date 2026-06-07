@@ -28,6 +28,28 @@ KBPKG_SCRIPT="$KBPKG_DIR/kbpkg.sh"
 
 # --- END CONFIGURATION ---
 
+# --- progress helpers ---
+
+_spinner() {
+  local pid=$1 msg=$2
+  local frames='|/-\'
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  %s %s" "${frames:$((i % 4)):1}" "$msg" >&2
+    sleep 0.1
+    i=$((i + 1))
+  done
+  printf "\r\033[K" >&2
+}
+
+_step() {
+  local n=$1 total=$2 msg=$3
+  printf "(%s/%s) %s\n" "$n" "$total" "$msg" >&2
+}
+
+_ok()   { printf "      done.\n" >&2; }
+_fail() { printf "      failed.\n" >&2; }
+
 # --- state file helpers ---
 
 _init_state() {
@@ -184,12 +206,18 @@ _parse_source_org() {
 _try_clone() {
   local reponame="$1"
   local dest="$2"
+  local tmp_err
+  tmp_err=$(mktemp)
   for base in "${SOURCES[@]}"; do
-    if git clone "$base/$reponame.git" "$dest" --quiet 2>/dev/null; then
+    if git clone --progress "$base/$reponame.git" "$dest" 2>"$tmp_err"; then
+      # indent git's progress output
+      sed 's/^/      /' "$tmp_err" >&2
+      rm -f "$tmp_err"
       echo "$base/$reponame"
       return 0
     fi
   done
+  rm -f "$tmp_err"
   return 1
 }
 
@@ -287,12 +315,16 @@ _install_binary() {
   [ "$platform" = "windows" ] && bin_name="$reponame.exe"
 
   if [ "$platform" = "linux-deb" ] && [[ "$bin_path" == *.deb ]]; then
-    echo "Installing .deb package (requires sudo)..." >&2
-    if ! sudo dpkg -i "$bin_path" >&2 2>&1; then
+    printf "      Installing .deb package (requires sudo)..." >&2
+    sudo dpkg -i "$bin_path" >/dev/null 2>&1 &
+    _spinner $! "Installing .deb package..."
+    wait $!
+    if [ $? -ne 0 ]; then
+      _fail
       echo "Error: dpkg -i failed." >&2
       return 1
     fi
-    # Find the installed binary: check common locations
+    _ok
     local deb_bin
     for candidate in "/usr/bin/$bin_name" "/usr/local/bin/$bin_name" "$install_dir/$bin_name"; do
       if [ -x "$candidate" ]; then
@@ -308,8 +340,12 @@ _install_binary() {
     return 0
   fi
 
-  cp "$bin_path" "$install_dir/$bin_name"
+  printf "      Copying to %s..." "$install_dir/$bin_name" >&2
+  cp "$bin_path" "$install_dir/$bin_name" &
+  _spinner $! "Copying..."
+  wait $!
   chmod +x "$install_dir/$bin_name"
+  _ok
 
   # Mac quarantine flag
   if [ "$platform" = "mac" ]; then
@@ -391,19 +427,22 @@ for p in data['packages']:
     return 1
   fi
 
-  echo "Looking for $reponame..."
+  local version type total_steps=3
   local source
+
+  _step 1 $total_steps "Fetching $reponame..."
   source=$(_try_clone "$reponame" "$dest")
   if [ $? -ne 0 ]; then
-    echo "Error: Could not find '$reponame' in any source."
+    echo "Error: Could not find '$reponame' in any source." >&2
     return 1
   fi
 
-  local version type
   version=$(_get_version "$dest")
   type=$(_get_type "$dest")
+  _step 2 $total_steps "Detected: $type"
 
   if [ "$type" = "binary" ]; then
+    _step 3 $total_steps "Installing binary..."
     local bin_install_path
     bin_install_path=$(_install_binary "$dest" "$reponame")
     if [ $? -ne 0 ]; then
@@ -412,9 +451,12 @@ for p in data['packages']:
     fi
     rm -rf "$dest"
     _state_add "$reponame" "$reponame" "$version" "$type" "$source" "$bin_install_path"
+    echo ""
     echo "Installed $reponame ($version) → $bin_install_path"
   else
+    _step 3 $total_steps "Setting up in $dest..."
     _state_add "$reponame" "$localname" "$version" "$type" "$source" "$dest"
+    echo ""
     echo "Installed $reponame ($version) → $dest"
   fi
 }
@@ -460,11 +502,16 @@ for p in data['packages']:
   if [ "$pkg_type" = "binary" ]; then
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    if ! git clone "$source.git" "$tmp_dir" --quiet 2>/dev/null; then
-      echo "Error: Could not fetch '$localname' from $source."
-      rm -rf "$tmp_dir"
+    local tmp_err
+    tmp_err=$(mktemp)
+    _step 1 3 "Fetching $localname..."
+    if ! git clone --progress "$source.git" "$tmp_dir" 2>"$tmp_err"; then
+      _fail
+      echo "Error: Could not fetch '$localname' from $source." >&2
+      rm -rf "$tmp_dir"; rm -f "$tmp_err"
       return 1
     fi
+    sed 's/^/      /' "$tmp_err" >&2; rm -f "$tmp_err"
 
     local remote_yml
     remote_yml=$(cat "$tmp_dir/kbpkg.yml" 2>/dev/null)
@@ -510,7 +557,8 @@ for p in data['packages']:
       fi
     fi
 
-    echo "Updating $localname..."
+    _step 2 3 "Checked: $old_version → $new_version"
+    _step 3 3 "Installing binary..."
     local reponame
     reponame=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['name'])" "$entry")
     local new_bin_path
@@ -518,21 +566,25 @@ for p in data['packages']:
     local install_status=$?
     rm -rf "$tmp_dir"
     if [ $install_status -ne 0 ]; then
-      echo "Error: Failed to install updated binary."
+      echo "Error: Failed to install updated binary." >&2
       return 1
     fi
     _state_update_version "$localname" "$new_version" "$new_bin_path"
+    echo ""
     echo "Updated $localname ($new_version) → $new_bin_path"
     return 0
   fi
 
   if [ ! -d "$path/.git" ]; then
-    echo "Error: '$localname' path not found at $path. Try 'kbpkg clean'."
+    echo "Error: '$localname' path not found at $path. Try 'kbpkg clean'." >&2
     return 1
   fi
 
-  # Fetch remote changes without applying yet
-  git -C "$path" fetch --quiet 2>/dev/null
+  _step 1 3 "Fetching $localname..."
+  local tmp_err
+  tmp_err=$(mktemp)
+  git -C "$path" fetch --progress 2>"$tmp_err"
+  sed 's/^/      /' "$tmp_err" >&2; rm -f "$tmp_err"
 
   # Read incoming kbpkg.yml from remote to check flags before pulling
   local remote_yml
@@ -582,11 +634,16 @@ for p in data['packages']:
     fi
   fi
 
-  echo "Updating $localname..."
-  git -C "$path" merge --quiet FETCH_HEAD
+  _step 2 3 "Checked: $old_version → $new_version"
+  _step 3 3 "Applying update..."
+  git -C "$path" merge --quiet FETCH_HEAD &
+  _spinner $! "Merging..."
+  wait $!
+  _ok
   local version
   version=$(_get_version "$path")
   _state_update_timestamp "$localname" "$version"
+  echo ""
   echo "Updated $localname ($version)"
 }
 
@@ -750,12 +807,18 @@ cmd_remove() {
     fi
   fi
 
+  _step 1 2 "Removing files..."
   if [ "$pkg_type" = "binary" ]; then
-    rm -f "$path"
+    rm -f "$path" &
   else
-    rm -rf "$path"
+    rm -rf "$path" &
   fi
+  _spinner $! "Removing..."
+  wait $!
+  _ok
+  _step 2 2 "Updating state..."
   _state_remove "$localname"
+  echo ""
   echo "Removed $localname."
 }
 

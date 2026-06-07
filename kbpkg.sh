@@ -21,7 +21,7 @@ SOURCES=(
 )
 
 # Location of kbpkg itself — update these if hosting your fork elsewhere.
-KBPKG_VERSION="2026-06-04"
+KBPKG_VERSION="2026-06-07"
 KBPKG_URL="https://codeberg.org/kbpkg/kbpkg/raw/branch/main/kbpkg.sh"
 KBPKG_UPDATE_URL="https://codeberg.org/kbpkg/kbpkg/raw/branch/main/UPDATE"
 KBPKG_SCRIPT="$KBPKG_DIR/kbpkg.sh"

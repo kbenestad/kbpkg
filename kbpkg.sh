@@ -258,17 +258,11 @@ _install_binary() {
     return 1
   fi
 
-  if [ "$platform" = "linux-deb" ]; then
-    echo "Installing .deb package (requires sudo)..."
-    sudo dpkg -i "$bin_path"
-    return $?
-  fi
-
   local install_dir
   case "$platform" in
-    linux) install_dir="$HOME/.local/bin" ;;
-    mac)   install_dir="/usr/local/bin" ;;
-    windows) install_dir="$USERPROFILE/AppData/Local/Microsoft/WindowsApps" ;;
+    linux|linux-deb) install_dir="$HOME/.local/bin" ;;
+    mac)             install_dir="/usr/local/bin" ;;
+    windows)         install_dir="$USERPROFILE/AppData/Local/Microsoft/WindowsApps" ;;
   esac
 
   mkdir -p "$install_dir"
@@ -276,8 +270,30 @@ _install_binary() {
   local bin_name="$reponame"
   [ "$platform" = "windows" ] && bin_name="$reponame.exe"
 
+  if [ "$platform" = "linux-deb" ] && [[ "$bin_path" == *.deb ]]; then
+    echo "Installing .deb package (requires sudo)..." >&2
+    if ! sudo dpkg -i "$bin_path" >&2 2>&1; then
+      echo "Error: dpkg -i failed." >&2
+      return 1
+    fi
+    # Find the installed binary: check common locations
+    local deb_bin
+    for candidate in "/usr/bin/$bin_name" "/usr/local/bin/$bin_name" "$install_dir/$bin_name"; do
+      if [ -x "$candidate" ]; then
+        deb_bin="$candidate"
+        break
+      fi
+    done
+    if [ -z "$deb_bin" ]; then
+      echo "Error: Could not locate installed binary after dpkg. Please check /usr/bin or /usr/local/bin." >&2
+      return 1
+    fi
+    echo "$deb_bin"
+    return 0
+  fi
+
   cp "$bin_path" "$install_dir/$bin_name"
-  chmod +x "$install_dir/$bin_name" 2>/dev/null
+  chmod +x "$install_dir/$bin_name"
 
   # Mac quarantine flag
   if [ "$platform" = "mac" ]; then

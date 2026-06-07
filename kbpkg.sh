@@ -21,7 +21,7 @@ SOURCES=(
 )
 
 # Location of kbpkg itself — update these if hosting your fork elsewhere.
-KBPKG_VERSION="2026-06-07"
+KBPKG_VERSION="2026-06-08"
 KBPKG_URL="https://codeberg.org/kbpkg/kbpkg/raw/branch/main/kbpkg.sh"
 KBPKG_UPDATE_URL="https://codeberg.org/kbpkg/kbpkg/raw/branch/main/UPDATE"
 KBPKG_SCRIPT="$KBPKG_DIR/kbpkg.sh"
@@ -209,9 +209,11 @@ _try_clone() {
   local tmp_err
   tmp_err=$(mktemp)
   for base in "${SOURCES[@]}"; do
+    # Redirect stderr to temp file; on success replay it so git's live
+    # progress (with \r rewrites) reaches the terminal via a subshell-safe path.
+    # On failure discard it so "not found" noise from other sources is hidden.
     if git clone --progress "$base/$reponame.git" "$dest" 2>"$tmp_err"; then
-      # indent git's progress output
-      sed 's/^/      /' "$tmp_err" >&2
+      cat "$tmp_err" >&2
       rm -f "$tmp_err"
       echo "$base/$reponame"
       return 0
@@ -279,7 +281,7 @@ _install_binary() {
   platform=$(_detect_platform)
 
   if [ "$platform" = "unknown" ]; then
-    echo "Error: Unsupported platform."
+    echo "Error: Unsupported platform." >&2
     return 1
   fi
 
@@ -292,13 +294,13 @@ _install_binary() {
   fi
 
   if [ -z "$bin_url" ]; then
-    echo "Error: No binary found for platform '$platform' in kbpkg.yml."
+    echo "Error: No binary entry found for platform '$platform' in kbpkg.yml. Check that the package has a 'bin:' section." >&2
     return 1
   fi
 
   local bin_path="$repo_path/$bin_url"
   if [ ! -f "$bin_path" ]; then
-    echo "Error: Binary not found at $bin_path."
+    echo "Error: Binary not found at '$bin_path'. The path in kbpkg.yml may be wrong." >&2
     return 1
   fi
 
@@ -344,6 +346,12 @@ _install_binary() {
   cp "$bin_path" "$install_dir/$bin_name" &
   _spinner $! "Copying..."
   wait $!
+  local cp_status=$?
+  if [ $cp_status -ne 0 ]; then
+    _fail
+    echo "Error: Failed to copy binary to $install_dir/$bin_name (exit $cp_status). Check permissions." >&2
+    return 1
+  fi
   chmod +x "$install_dir/$bin_name"
   _ok
 

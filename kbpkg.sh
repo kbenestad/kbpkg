@@ -85,6 +85,22 @@ json.dump(data, open('$STATE_FILE','w'), indent=2)
 " "$1" "$2"
 }
 
+_state_update_version() {
+  # usage: _state_update_version LOCALNAME VERSION PATH
+  python3 -c "
+import json, sys
+from datetime import datetime, timezone
+data = json.load(open('$STATE_FILE'))
+now = datetime.now(timezone.utc).isoformat()
+for p in data['packages']:
+    if p['localname'] == sys.argv[1]:
+        p['updated'] = now
+        p['version'] = sys.argv[2]
+        p['path'] = sys.argv[3]
+json.dump(data, open('$STATE_FILE','w'), indent=2)
+" "$1" "$2" "$3"
+}
+
 _state_remove() {
   # usage: _state_remove LOCALNAME
   python3 -c "
@@ -435,9 +451,80 @@ for p in data['packages']:
     return 1
   fi
 
-  local path old_version
+  local path old_version pkg_type source
   path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry")
   old_version=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$entry")
+  pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry")
+  source=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['source'])" "$entry")
+
+  if [ "$pkg_type" = "binary" ]; then
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! git clone "$source.git" "$tmp_dir" --quiet 2>/dev/null; then
+      echo "Error: Could not fetch '$localname' from $source."
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+
+    local remote_yml
+    remote_yml=$(cat "$tmp_dir/kbpkg.yml" 2>/dev/null)
+
+    local new_version breaking_changes breaking_message docs_url
+    new_version=$(echo "$remote_yml" | grep '^version:' | awk '{print $2}' | tr -d '"')
+    breaking_changes=$(echo "$remote_yml" | grep '^breakingchanges:' | awk '{print $2}' | tr -d '"')
+    breaking_message=$(echo "$remote_yml" | grep '^breakingmessage:' | sed 's/^breakingmessage: *//' | tr -d '"')
+    docs_url=$(echo "$remote_yml" | grep '^\s*docs:' | sed 's/.*docs: *//' | tr -d '"')
+
+    new_version="${new_version:-unknown}"
+    breaking_changes="${breaking_changes:-no}"
+
+    local warn=0 warn_type=""
+    if [ "$breaking_changes" = "yes" ]; then
+      warn=1; warn_type="breaking"
+    elif [ "$old_version" != "unknown" ] && [ "$new_version" != "unknown" ]; then
+      local old_major new_major
+      old_major=$(_get_major_version "$old_version")
+      new_major=$(_get_major_version "$new_version")
+      if [ "$new_major" -gt "$old_major" ] 2>/dev/null; then
+        warn=1; warn_type="major"
+      fi
+    fi
+
+    if [ "$warn" -eq 1 ] && [ "$force" != "-y" ]; then
+      echo ""
+      if [ "$warn_type" = "breaking" ]; then
+        echo "BREAKING CHANGES: $localname contains breaking changes."
+        [ -n "$breaking_message" ] && echo "  $breaking_message"
+      else
+        echo "MAJOR UPDATE: $localname is updating from version $old_version to $new_version."
+      fi
+      [ -n "$docs_url" ] && echo "  Please consult the documentation at $docs_url before updating."
+      echo ""
+      printf "[A]bort / [U]pdate: "
+      read -r answer
+      answer="${answer:-A}"
+      if [ "$answer" != "U" ] && [ "$answer" != "u" ]; then
+        echo "Skipped $localname."
+        rm -rf "$tmp_dir"
+        return 2
+      fi
+    fi
+
+    echo "Updating $localname..."
+    local reponame
+    reponame=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['name'])" "$entry")
+    local new_bin_path
+    new_bin_path=$(_install_binary "$tmp_dir" "$reponame")
+    local install_status=$?
+    rm -rf "$tmp_dir"
+    if [ $install_status -ne 0 ]; then
+      echo "Error: Failed to install updated binary."
+      return 1
+    fi
+    _state_update_version "$localname" "$new_version" "$new_bin_path"
+    echo "Updated $localname ($new_version) → $new_bin_path"
+    return 0
+  fi
 
   if [ ! -d "$path/.git" ]; then
     echo "Error: '$localname' path not found at $path. Try 'kbpkg clean'."
@@ -604,10 +691,12 @@ cmd_clean() {
 import json, os
 data = json.load(open('$STATE_FILE'))
 before = len(data['packages'])
-data['packages'] = [
-    p for p in data['packages']
-    if os.path.isdir(os.path.join(p['path'], '.git'))
-]
+def is_valid(p):
+    pkg_type = p.get('type', 'web')
+    if pkg_type == 'binary':
+        return os.path.isfile(p['path'])
+    return os.path.isdir(os.path.join(p['path'], '.git'))
+data['packages'] = [p for p in data['packages'] if is_valid(p)]
 after = len(data['packages'])
 json.dump(data, open('$STATE_FILE','w'), indent=2)
 removed = before - after

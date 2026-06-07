@@ -3,7 +3,7 @@ description: Short description of the project
 version: 0.1.0
 type: web
 author: kbenestad
-license: MIT
+license: AGPL-3.0
 urls:
   dev: https://codeberg.org/kbenestad/myproject
   docs: https://docs.example.com/myproject

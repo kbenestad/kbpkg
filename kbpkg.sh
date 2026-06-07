@@ -11,6 +11,9 @@
 KBPKG_DIR="$HOME/.kbpkg"
 STATE_FILE="$KBPKG_DIR/packages.json"
 
+# Timeout in seconds for each git clone/fetch attempt.
+CLONE_TIMEOUT=30
+
 # Package sources — checked in order, first match wins.
 # For Forgejo/Codeberg: "https://yourhost.org/yourorg"
 # For GitHub: "https://github.com/yourorg"
@@ -27,6 +30,10 @@ KBPKG_UPDATE_URL="https://codeberg.org/kbpkg/kbpkg/raw/branch/main/UPDATE"
 KBPKG_SCRIPT="$KBPKG_DIR/kbpkg.sh"
 
 # --- END CONFIGURATION ---
+
+# STATE_FILE exposed as env var so Python snippets never interpolate the path
+# into source code strings (protects against paths with special characters).
+export KBPKG_STATE="$STATE_FILE"
 
 # --- progress helpers ---
 
@@ -62,8 +69,8 @@ _init_state() {
 _state_get() {
   # usage: _state_get LOCALNAME
   python3 -c "
-import json, sys
-data = json.load(open('$STATE_FILE'))
+import json, sys, os
+data = json.load(open(os.environ['KBPKG_STATE']))
 for p in data['packages']:
     if p['localname'] == sys.argv[1]:
         print(json.dumps(p))
@@ -74,62 +81,76 @@ for p in data['packages']:
 _state_add() {
   # usage: _state_add NAME LOCALNAME VERSION TYPE SOURCE PATH
   python3 -c "
-import json, sys
+import json, sys, os
 from datetime import datetime, timezone
-data = json.load(open('$STATE_FILE'))
+data = json.load(open(os.environ['KBPKG_STATE']))
 now = datetime.now(timezone.utc).isoformat()
 data['packages'].append({
-    'name': sys.argv[1],
+    'name':      sys.argv[1],
     'localname': sys.argv[2],
-    'version': sys.argv[3],
-    'type': sys.argv[4],
-    'source': sys.argv[5],
-    'path': sys.argv[6],
+    'version':   sys.argv[3],
+    'type':      sys.argv[4],
+    'source':    sys.argv[5],
+    'path':      sys.argv[6],
+    'locked':    False,
     'installed': now,
-    'updated': now
+    'updated':   now
 })
-json.dump(data, open('$STATE_FILE','w'), indent=2)
+json.dump(data, open(os.environ['KBPKG_STATE'], 'w'), indent=2)
 " "$1" "$2" "$3" "$4" "$5" "$6"
 }
 
 _state_update_timestamp() {
   # usage: _state_update_timestamp LOCALNAME VERSION
   python3 -c "
-import json, sys
+import json, sys, os
 from datetime import datetime, timezone
-data = json.load(open('$STATE_FILE'))
+data = json.load(open(os.environ['KBPKG_STATE']))
 now = datetime.now(timezone.utc).isoformat()
 for p in data['packages']:
     if p['localname'] == sys.argv[1]:
         p['updated'] = now
         p['version'] = sys.argv[2]
-json.dump(data, open('$STATE_FILE','w'), indent=2)
+json.dump(data, open(os.environ['KBPKG_STATE'], 'w'), indent=2)
 " "$1" "$2"
 }
 
 _state_update_version() {
   # usage: _state_update_version LOCALNAME VERSION PATH
   python3 -c "
-import json, sys
+import json, sys, os
 from datetime import datetime, timezone
-data = json.load(open('$STATE_FILE'))
+data = json.load(open(os.environ['KBPKG_STATE']))
 now = datetime.now(timezone.utc).isoformat()
 for p in data['packages']:
     if p['localname'] == sys.argv[1]:
         p['updated'] = now
         p['version'] = sys.argv[2]
-        p['path'] = sys.argv[3]
-json.dump(data, open('$STATE_FILE','w'), indent=2)
+        p['path']    = sys.argv[3]
+json.dump(data, open(os.environ['KBPKG_STATE'], 'w'), indent=2)
 " "$1" "$2" "$3"
+}
+
+_state_set_locked() {
+  # usage: _state_set_locked LOCALNAME true|false
+  python3 -c "
+import json, sys, os
+data = json.load(open(os.environ['KBPKG_STATE']))
+val = sys.argv[2].lower() == 'true'
+for p in data['packages']:
+    if p['localname'] == sys.argv[1]:
+        p['locked'] = val
+json.dump(data, open(os.environ['KBPKG_STATE'], 'w'), indent=2)
+" "$1" "$2"
 }
 
 _state_remove() {
   # usage: _state_remove LOCALNAME
   python3 -c "
-import json, sys
-data = json.load(open('$STATE_FILE'))
+import json, sys, os
+data = json.load(open(os.environ['KBPKG_STATE']))
 data['packages'] = [p for p in data['packages'] if p['localname'] != sys.argv[1]]
-json.dump(data, open('$STATE_FILE','w'), indent=2)
+json.dump(data, open(os.environ['KBPKG_STATE'], 'w'), indent=2)
 " "$1"
 }
 
@@ -176,19 +197,19 @@ _get_breaking_message() {
 }
 
 _get_docs_url() {
-  local path="$1"
-  if [ -f "$path/kbpkg.yml" ]; then
-    python3 -c "
+  local yml_path="$1/kbpkg.yml"
+  [ -f "$yml_path" ] || return
+  python3 -c "
 import sys
 try:
-    for line in open('$path/kbpkg.yml'):
+    for line in open(sys.argv[1]):
         line = line.strip()
         if line.startswith('docs:'):
             print(line.split(':', 1)[1].strip())
             break
-except: pass
-" 2>/dev/null
-  fi
+except Exception:
+    pass
+" "$yml_path" 2>/dev/null
 }
 
 # --- source URL helpers ---
@@ -209,10 +230,8 @@ _try_clone() {
   local tmp_err
   tmp_err=$(mktemp)
   for base in "${SOURCES[@]}"; do
-    # Redirect stderr to temp file; on success replay it so git's live
-    # progress (with \r rewrites) reaches the terminal via a subshell-safe path.
-    # On failure discard it so "not found" noise from other sources is hidden.
-    if git clone --progress "$base/$reponame.git" "$dest" 2>"$tmp_err"; then
+    if GIT_TERMINAL_PROMPT=0 timeout "$CLONE_TIMEOUT" \
+         git clone --progress "$base/$reponame.git" "$dest" 2>"$tmp_err"; then
       cat "$tmp_err" >&2
       rm -f "$tmp_err"
       echo "$base/$reponame"
@@ -227,24 +246,30 @@ _try_clone() {
 # --- platform detection and binary install ---
 
 _detect_platform() {
-  local os arch
+  local os arch norm_arch
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
 
+  case "$arch" in
+    x86_64|amd64)  norm_arch="amd64" ;;
+    aarch64|arm64) norm_arch="arm64" ;;
+    i386|i686)     norm_arch="386" ;;
+    *)             norm_arch="$arch" ;;
+  esac
+
   case "$os" in
     linux)
-      # Check for Debian/Ubuntu
       if command -v dpkg &>/dev/null && command -v apt &>/dev/null; then
-        echo "linux-deb"
+        echo "linux-deb-$norm_arch"
       else
-        echo "linux"
+        echo "linux-$norm_arch"
       fi
       ;;
     darwin)
-      echo "mac"
+      echo "mac-$norm_arch"
       ;;
     msys*|mingw*|cygwin*)
-      echo "windows"
+      echo "windows-$norm_arch"
       ;;
     *)
       echo "unknown"
@@ -286,11 +311,38 @@ _install_binary() {
   fi
 
   local bin_url
-  # Try platform-specific first, fall back to linux if linux-deb not found
   bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "$platform")
-  if [ -z "$bin_url" ] && [ "$platform" = "linux-deb" ]; then
-    bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "linux")
-    platform="linux"
+
+  # Fallback chain: try progressively less-specific keys for backward compat
+  if [ -z "$bin_url" ]; then
+    case "$platform" in
+      linux-deb-*)
+        local arch="${platform#linux-deb-}"
+        bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "linux-deb")
+        if [ -z "$bin_url" ]; then
+          bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "linux-$arch")
+          [ -n "$bin_url" ] && platform="linux-$arch"
+        else
+          platform="linux-deb"
+        fi
+        if [ -z "$bin_url" ]; then
+          bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "linux")
+          [ -n "$bin_url" ] && platform="linux"
+        fi
+        ;;
+      linux-*)
+        bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "linux")
+        [ -n "$bin_url" ] && platform="linux"
+        ;;
+      mac-*)
+        bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "mac")
+        [ -n "$bin_url" ] && platform="mac"
+        ;;
+      windows-*)
+        bin_url=$(_get_bin_url "$repo_path/kbpkg.yml" "windows")
+        [ -n "$bin_url" ] && platform="windows"
+        ;;
+    esac
   fi
 
   if [ -z "$bin_url" ]; then
@@ -306,17 +358,17 @@ _install_binary() {
 
   local install_dir
   case "$platform" in
-    linux|linux-deb) install_dir="$HOME/.local/bin" ;;
-    mac)             install_dir="/usr/local/bin" ;;
-    windows)         install_dir="$USERPROFILE/AppData/Local/Microsoft/WindowsApps" ;;
+    linux*)   install_dir="$HOME/.local/bin" ;;
+    mac*)     install_dir="/usr/local/bin" ;;
+    windows*) install_dir="$USERPROFILE/AppData/Local/Microsoft/WindowsApps" ;;
   esac
 
   mkdir -p "$install_dir"
 
   local bin_name="$reponame"
-  [ "$platform" = "windows" ] && bin_name="$reponame.exe"
+  case "$platform" in windows*) bin_name="$reponame.exe" ;; esac
 
-  if [ "$platform" = "linux-deb" ] && [[ "$bin_path" == *.deb ]]; then
+  if [[ "$platform" == linux-deb* ]] && [[ "$bin_path" == *.deb ]]; then
     printf "      Installing .deb package (requires sudo)..." >&2
     sudo dpkg -i "$bin_path" >/dev/null 2>&1 &
     _spinner $! "Installing .deb package..."
@@ -356,9 +408,9 @@ _install_binary() {
   _ok
 
   # Mac quarantine flag
-  if [ "$platform" = "mac" ]; then
-    xattr -d com.apple.quarantine "$install_dir/$bin_name" 2>/dev/null || true
-  fi
+  case "$platform" in
+    mac*) xattr -d com.apple.quarantine "$install_dir/$bin_name" 2>/dev/null || true ;;
+  esac
 
   echo "$install_dir/$bin_name"
 }
@@ -377,16 +429,16 @@ cmd_install() {
   # Check if this repo name is already in state
   local existing existing_type
   existing=$(python3 -c "
-import json, sys
-data = json.load(open('$STATE_FILE'))
+import json, sys, os
+data = json.load(open(os.environ['KBPKG_STATE']))
 for p in data['packages']:
     if p['name'] == sys.argv[1]:
         print(p['localname'])
         break
 " "$reponame")
   existing_type=$(python3 -c "
-import json, sys
-data = json.load(open('$STATE_FILE'))
+import json, sys, os
+data = json.load(open(os.environ['KBPKG_STATE']))
 for p in data['packages']:
     if p['name'] == sys.argv[1]:
         print(p.get('type', 'web'))
@@ -482,8 +534,8 @@ cmd_update() {
         skipped+=("$name")
       fi
     done < <(python3 -c "
-import json
-data = json.load(open('$STATE_FILE'))
+import json, os
+data = json.load(open(os.environ['KBPKG_STATE']))
 for p in data['packages']:
     print(p['localname'])
 ")
@@ -506,6 +558,13 @@ for p in data['packages']:
   old_version=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$entry")
   pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry")
   source=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['source'])" "$entry")
+  local locked
+  locked=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('locked', False))" "$entry")
+
+  if [ "$locked" = "True" ]; then
+    echo "Skipping $localname (updates locked — run 'kbpkg removeupdateflag $localname' to re-enable)."
+    return 3
+  fi
 
   if [ "$pkg_type" = "binary" ]; then
     local tmp_dir
@@ -513,7 +572,8 @@ for p in data['packages']:
     local tmp_err
     tmp_err=$(mktemp)
     _step 1 3 "Fetching $localname..."
-    if ! git clone --progress "$source.git" "$tmp_dir" 2>"$tmp_err"; then
+    if ! GIT_TERMINAL_PROMPT=0 timeout "$CLONE_TIMEOUT" \
+         git clone --progress "$source.git" "$tmp_dir" 2>"$tmp_err"; then
       _fail
       echo "Error: Could not fetch '$localname' from $source." >&2
       rm -rf "$tmp_dir"; rm -f "$tmp_err"
@@ -551,18 +611,27 @@ for p in data['packages']:
         echo "BREAKING CHANGES: $localname contains breaking changes."
         [ -n "$breaking_message" ] && echo "  $breaking_message"
       else
-        echo "MAJOR UPDATE: $localname is updating from version $old_version to $new_version."
+        echo "MAJOR UPDATE: $localname ($old_version → $new_version)"
       fi
-      [ -n "$docs_url" ] && echo "  Please consult the documentation at $docs_url before updating."
+      [ -n "$docs_url" ] && echo "  Docs: $docs_url"
       echo ""
-      printf "[A]bort / [U]pdate: "
+      printf "[U]pdate / [S]kip this time / [P]ermanently skip / [A]bort: "
       read -r answer
       answer="${answer:-A}"
-      if [ "$answer" != "U" ] && [ "$answer" != "u" ]; then
-        echo "Skipped $localname."
-        rm -rf "$tmp_dir"
-        return 2
-      fi
+      case "$answer" in
+        U|u) ;;
+        P|p)
+          _state_set_locked "$localname" true
+          echo "Updates permanently disabled for $localname."
+          rm -rf "$tmp_dir"
+          return 3
+          ;;
+        *)
+          echo "Skipped $localname."
+          rm -rf "$tmp_dir"
+          return 2
+          ;;
+      esac
     fi
 
     _step 2 3 "Checked: $old_version → $new_version"
@@ -591,8 +660,8 @@ for p in data['packages']:
   _step 1 3 "Fetching $localname..."
   local tmp_err
   tmp_err=$(mktemp)
-  git -C "$path" fetch --progress 2>"$tmp_err"
-  sed 's/^/      /' "$tmp_err" >&2; rm -f "$tmp_err"
+  GIT_TERMINAL_PROMPT=0 timeout "$CLONE_TIMEOUT" git -C "$path" fetch --progress 2>"$tmp_err"
+  cat "$tmp_err" >&2; rm -f "$tmp_err"
 
   # Read incoming kbpkg.yml from remote to check flags before pulling
   local remote_yml
@@ -629,17 +698,27 @@ for p in data['packages']:
       echo "BREAKING CHANGES: $localname contains breaking changes."
       [ -n "$breaking_message" ] && echo "  $breaking_message"
     else
-      echo "MAJOR UPDATE: $localname is updating from version $old_version to $new_version."
+      echo "MAJOR UPDATE: $localname ($old_version → $new_version)"
     fi
-    [ -n "$docs_url" ] && echo "  Please consult the documentation at $docs_url before updating."
+    [ -n "$docs_url" ] && echo "  Docs: $docs_url"
     echo ""
-    printf "[A]bort / [U]pdate: "
+    printf "[U]pdate / [S]kip this time / [P]ermanently skip / [A]bort: "
     read -r answer
     answer="${answer:-A}"
-    if [ "$answer" != "U" ] && [ "$answer" != "u" ]; then
-      echo "Skipped $localname."
-      return 2
-    fi
+    case "$answer" in
+      U|u) ;;
+      P|p)
+        git -C "$path" update-ref -d FETCH_HEAD 2>/dev/null || true
+        _state_set_locked "$localname" true
+        echo "Updates permanently disabled for $localname."
+        return 3
+        ;;
+      *)
+        git -C "$path" update-ref -d FETCH_HEAD 2>/dev/null || true
+        echo "Skipped $localname."
+        return 2
+        ;;
+    esac
   fi
 
   _step 2 3 "Checked: $old_version → $new_version"
@@ -656,10 +735,18 @@ for p in data['packages']:
 }
 
 cmd_run() {
-  local localname="$1"
+  local localname=""
+  local port=8000
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--port) port="$2"; shift 2 ;;
+      *)         localname="$1"; shift ;;
+    esac
+  done
 
   if [ -z "$localname" ]; then
-    echo "Usage: kbpkg run LOCALNAME"
+    echo "Usage: kbpkg run LOCALNAME [-p PORT]"
     return 1
   fi
 
@@ -678,16 +765,29 @@ cmd_run() {
     return 1
   fi
 
-  echo "Starting server for $localname at http://localhost:8000"
+  # Check whether port is already in use
+  if command -v ss &>/dev/null; then
+    if ss -tlnH "sport = :$port" 2>/dev/null | grep -q .; then
+      echo "Error: Port $port is already in use. Use -p / --port to choose another."
+      return 1
+    fi
+  elif command -v lsof &>/dev/null; then
+    if lsof -iTCP:"$port" -sTCP:LISTEN &>/dev/null; then
+      echo "Error: Port $port is already in use. Use -p / --port to choose another."
+      return 1
+    fi
+  fi
+
+  echo "Starting server for $localname at http://localhost:$port"
   (
     sleep 1
     if command -v xdg-open &>/dev/null; then
-      xdg-open http://localhost:8000
+      xdg-open "http://localhost:$port"
     elif command -v open &>/dev/null; then
-      open http://localhost:8000
+      open "http://localhost:$port"
     fi
   ) &
-  python3 -m http.server 8000 --directory "$path"
+  python3 -m http.server "$port" --directory "$path"
 }
 
 _fetch_latest_version() {
@@ -723,8 +823,8 @@ cmd_list() {
 
   local pkgs
   pkgs=$(python3 -c "
-import json, sys
-data = json.load(open('$STATE_FILE'))
+import json, sys, os
+data = json.load(open(os.environ['KBPKG_STATE']))
 if not data['packages']:
     sys.exit(1)
 for p in data['packages']:
@@ -748,7 +848,7 @@ for p in data['packages']:
   python3 -c "
 import json, sys
 
-state   = json.load(open('$STATE_FILE'))
+state   = json.load(open(__import__('os').environ['KBPKG_STATE']))
 pkgs    = state['packages']
 
 # Parse latest_pairs passed via argv[1]: 'localname=version\n...'
@@ -831,10 +931,26 @@ cmd_remove() {
   echo "Removed $localname."
 }
 
+cmd_removeupdateflag() {
+  local localname="$1"
+  if [ -z "$localname" ]; then
+    echo "Usage: kbpkg removeupdateflag LOCALNAME"
+    return 1
+  fi
+  local entry
+  entry=$(_state_get "$localname")
+  if [ -z "$entry" ]; then
+    echo "Error: '$localname' is not installed."
+    return 1
+  fi
+  _state_set_locked "$localname" false
+  echo "Updates re-enabled for $localname."
+}
+
 cmd_clean() {
   python3 -c "
 import json, os
-data = json.load(open('$STATE_FILE'))
+data = json.load(open(os.environ['KBPKG_STATE']))
 before = len(data['packages'])
 def is_valid(p):
     pkg_type = p.get('type', 'web')
@@ -843,7 +959,7 @@ def is_valid(p):
     return os.path.isdir(os.path.join(p['path'], '.git'))
 data['packages'] = [p for p in data['packages'] if is_valid(p)]
 after = len(data['packages'])
-json.dump(data, open('$STATE_FILE','w'), indent=2)
+json.dump(data, open(os.environ['KBPKG_STATE'], 'w'), indent=2)
 removed = before - after
 if removed:
     print(f'Removed {removed} stale entry/entries from state.')
@@ -1059,31 +1175,33 @@ kbpkg() {
   local cmd="$1"
   shift
   case "$cmd" in
-    install)  cmd_install "$@" ;;
-    update)   cmd_update "$@" ;;
-    run)      cmd_run "$@" ;;
-    list)     cmd_list ;;
-    remove)   cmd_remove "$@" ;;
-    clean)    cmd_clean ;;
-    upgrade)  cmd_upgrade ;;
-    uninstall) cmd_uninstall ;;
-    packages) cmd_packages ;;
-    details)  cmd_details "$@" ;;
+    install)          cmd_install "$@" ;;
+    update)           cmd_update "$@" ;;
+    run)              cmd_run "$@" ;;
+    list)             cmd_list ;;
+    remove)           cmd_remove "$@" ;;
+    clean)            cmd_clean ;;
+    upgrade)          cmd_upgrade ;;
+    uninstall)        cmd_uninstall ;;
+    packages)         cmd_packages ;;
+    details)          cmd_details "$@" ;;
+    removeupdateflag) cmd_removeupdateflag "$@" ;;
     *)
       _check_version
       echo "kbpkg - package manager"
       echo ""
       echo "Commands:"
-      echo "  install REPONAME [LOCALNAME]  Install a package"
-      echo "  update [LOCALNAME] [-y]       Update one or all packages (skip warnings with -y)"
-      echo "  run LOCALNAME                 Run a web package locally"
-      echo "  list                          List installed packages"
-      echo "  remove LOCALNAME [-y]         Remove a package"
-      echo "  clean                         Remove stale state entries"
-      echo "  upgrade                       Upgrade kbpkg to the latest version"
-      echo "  uninstall                     Remove kbpkg from this machine"
-      echo "  packages                      List all available packages from sources"
-      echo "  details REPONAME              Show metadata for a package"
+      echo "  install REPONAME [LOCALNAME]        Install a package"
+      echo "  update [LOCALNAME] [-y]             Update one or all packages"
+      echo "  run LOCALNAME [-p PORT]             Run a web package locally (default port 8000)"
+      echo "  list                                List installed packages"
+      echo "  remove LOCALNAME [-y]               Remove a package"
+      echo "  removeupdateflag LOCALNAME          Re-enable updates for a locked package"
+      echo "  clean                               Remove stale state entries"
+      echo "  upgrade                             Upgrade kbpkg to the latest version"
+      echo "  uninstall                           Remove kbpkg from this machine"
+      echo "  packages                            List all available packages from sources"
+      echo "  details REPONAME                    Show metadata for a package"
       ;;
   esac
 }

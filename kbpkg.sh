@@ -21,7 +21,7 @@ SOURCES=(
 )
 
 # Location of kbpkg itself — update these if hosting your fork elsewhere.
-KBPKG_VERSION="2026-06-04"
+KBPKG_VERSION="2026-06-07"
 KBPKG_URL="https://codeberg.org/kbpkg/kbpkg/raw/branch/main/kbpkg.sh"
 KBPKG_UPDATE_URL="https://codeberg.org/kbpkg/kbpkg/raw/branch/main/UPDATE"
 KBPKG_SCRIPT="$KBPKG_DIR/kbpkg.sh"
@@ -83,6 +83,22 @@ for p in data['packages']:
         p['version'] = sys.argv[2]
 json.dump(data, open('$STATE_FILE','w'), indent=2)
 " "$1" "$2"
+}
+
+_state_update_version() {
+  # usage: _state_update_version LOCALNAME VERSION PATH
+  python3 -c "
+import json, sys
+from datetime import datetime, timezone
+data = json.load(open('$STATE_FILE'))
+now = datetime.now(timezone.utc).isoformat()
+for p in data['packages']:
+    if p['localname'] == sys.argv[1]:
+        p['updated'] = now
+        p['version'] = sys.argv[2]
+        p['path'] = sys.argv[3]
+json.dump(data, open('$STATE_FILE','w'), indent=2)
+" "$1" "$2" "$3"
 }
 
 _state_remove() {
@@ -258,17 +274,11 @@ _install_binary() {
     return 1
   fi
 
-  if [ "$platform" = "linux-deb" ]; then
-    echo "Installing .deb package (requires sudo)..."
-    sudo dpkg -i "$bin_path"
-    return $?
-  fi
-
   local install_dir
   case "$platform" in
-    linux) install_dir="$HOME/.local/bin" ;;
-    mac)   install_dir="/usr/local/bin" ;;
-    windows) install_dir="$USERPROFILE/AppData/Local/Microsoft/WindowsApps" ;;
+    linux|linux-deb) install_dir="$HOME/.local/bin" ;;
+    mac)             install_dir="/usr/local/bin" ;;
+    windows)         install_dir="$USERPROFILE/AppData/Local/Microsoft/WindowsApps" ;;
   esac
 
   mkdir -p "$install_dir"
@@ -276,8 +286,30 @@ _install_binary() {
   local bin_name="$reponame"
   [ "$platform" = "windows" ] && bin_name="$reponame.exe"
 
+  if [ "$platform" = "linux-deb" ] && [[ "$bin_path" == *.deb ]]; then
+    echo "Installing .deb package (requires sudo)..." >&2
+    if ! sudo dpkg -i "$bin_path" >&2 2>&1; then
+      echo "Error: dpkg -i failed." >&2
+      return 1
+    fi
+    # Find the installed binary: check common locations
+    local deb_bin
+    for candidate in "/usr/bin/$bin_name" "/usr/local/bin/$bin_name" "$install_dir/$bin_name"; do
+      if [ -x "$candidate" ]; then
+        deb_bin="$candidate"
+        break
+      fi
+    done
+    if [ -z "$deb_bin" ]; then
+      echo "Error: Could not locate installed binary after dpkg. Please check /usr/bin or /usr/local/bin." >&2
+      return 1
+    fi
+    echo "$deb_bin"
+    return 0
+  fi
+
   cp "$bin_path" "$install_dir/$bin_name"
-  chmod +x "$install_dir/$bin_name" 2>/dev/null
+  chmod +x "$install_dir/$bin_name"
 
   # Mac quarantine flag
   if [ "$platform" = "mac" ]; then
@@ -419,9 +451,80 @@ for p in data['packages']:
     return 1
   fi
 
-  local path old_version
+  local path old_version pkg_type source
   path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry")
   old_version=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$entry")
+  pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry")
+  source=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['source'])" "$entry")
+
+  if [ "$pkg_type" = "binary" ]; then
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! git clone "$source.git" "$tmp_dir" --quiet 2>/dev/null; then
+      echo "Error: Could not fetch '$localname' from $source."
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+
+    local remote_yml
+    remote_yml=$(cat "$tmp_dir/kbpkg.yml" 2>/dev/null)
+
+    local new_version breaking_changes breaking_message docs_url
+    new_version=$(echo "$remote_yml" | grep '^version:' | awk '{print $2}' | tr -d '"')
+    breaking_changes=$(echo "$remote_yml" | grep '^breakingchanges:' | awk '{print $2}' | tr -d '"')
+    breaking_message=$(echo "$remote_yml" | grep '^breakingmessage:' | sed 's/^breakingmessage: *//' | tr -d '"')
+    docs_url=$(echo "$remote_yml" | grep '^\s*docs:' | sed 's/.*docs: *//' | tr -d '"')
+
+    new_version="${new_version:-unknown}"
+    breaking_changes="${breaking_changes:-no}"
+
+    local warn=0 warn_type=""
+    if [ "$breaking_changes" = "yes" ]; then
+      warn=1; warn_type="breaking"
+    elif [ "$old_version" != "unknown" ] && [ "$new_version" != "unknown" ]; then
+      local old_major new_major
+      old_major=$(_get_major_version "$old_version")
+      new_major=$(_get_major_version "$new_version")
+      if [ "$new_major" -gt "$old_major" ] 2>/dev/null; then
+        warn=1; warn_type="major"
+      fi
+    fi
+
+    if [ "$warn" -eq 1 ] && [ "$force" != "-y" ]; then
+      echo ""
+      if [ "$warn_type" = "breaking" ]; then
+        echo "BREAKING CHANGES: $localname contains breaking changes."
+        [ -n "$breaking_message" ] && echo "  $breaking_message"
+      else
+        echo "MAJOR UPDATE: $localname is updating from version $old_version to $new_version."
+      fi
+      [ -n "$docs_url" ] && echo "  Please consult the documentation at $docs_url before updating."
+      echo ""
+      printf "[A]bort / [U]pdate: "
+      read -r answer
+      answer="${answer:-A}"
+      if [ "$answer" != "U" ] && [ "$answer" != "u" ]; then
+        echo "Skipped $localname."
+        rm -rf "$tmp_dir"
+        return 2
+      fi
+    fi
+
+    echo "Updating $localname..."
+    local reponame
+    reponame=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['name'])" "$entry")
+    local new_bin_path
+    new_bin_path=$(_install_binary "$tmp_dir" "$reponame")
+    local install_status=$?
+    rm -rf "$tmp_dir"
+    if [ $install_status -ne 0 ]; then
+      echo "Error: Failed to install updated binary."
+      return 1
+    fi
+    _state_update_version "$localname" "$new_version" "$new_bin_path"
+    echo "Updated $localname ($new_version) → $new_bin_path"
+    return 0
+  fi
 
   if [ ! -d "$path/.git" ]; then
     echo "Error: '$localname' path not found at $path. Try 'kbpkg clean'."
@@ -522,22 +625,95 @@ cmd_run() {
   python3 -m http.server 8000 --directory "$path"
 }
 
+_fetch_latest_version() {
+  local pkg_type="$1"
+  local path="$2"
+  local source="$3"
+  local remote_yml=""
+
+  if [ "$pkg_type" = "binary" ]; then
+    local host
+    host=$(echo "$source" | sed 's|https://||' | cut -d'/' -f1)
+    if echo "$host" | grep -q "github.com"; then
+      local slug
+      slug=$(echo "$source" | sed 's|https://github.com/||')
+      remote_yml=$(curl -fsSL "https://raw.githubusercontent.com/$slug/main/kbpkg.yml" 2>/dev/null)
+      [ -z "$remote_yml" ] && remote_yml=$(curl -fsSL "https://raw.githubusercontent.com/$slug/master/kbpkg.yml" 2>/dev/null)
+    else
+      remote_yml=$(curl -fsSL "$source/raw/branch/main/kbpkg.yml" 2>/dev/null)
+      [ -z "$remote_yml" ] && remote_yml=$(curl -fsSL "$source/raw/branch/master/kbpkg.yml" 2>/dev/null)
+    fi
+  else
+    if [ -d "$path/.git" ]; then
+      git -C "$path" fetch --quiet 2>/dev/null
+      remote_yml=$(git -C "$path" show FETCH_HEAD:kbpkg.yml 2>/dev/null)
+    fi
+  fi
+
+  echo "$remote_yml" | grep '^version:' | awk '{print $2}' | tr -d '"'
+}
+
 cmd_list() {
   _check_version
-  python3 -c "
+
+  local packages
+  packages=$(python3 -c "
 import json
 data = json.load(open('$STATE_FILE'))
-if not data['packages']:
-    print('No packages installed.')
-else:
-    fmt = '{:<20} {:<12} {:<10} {:<10} {}'
-    print(fmt.format('NAME', 'LOCALNAME', 'VERSION', 'TYPE', 'PATH'))
-    print('-' * 80)
-    for p in data['packages']:
-        pkg_type = p.get('type', 'web')
-        path_label = p['path'] if pkg_type != 'binary' else p['path']
-        print(fmt.format(p['name'], p['localname'], p['version'], pkg_type, path_label))
-"
+import json as j
+for p in data['packages']:
+    print(j.dumps(p))
+")
+
+  if [ -z "$packages" ]; then
+    echo "No packages installed."
+    return
+  fi
+
+  local -A latest_map
+  echo "Checking for updates..." >&2
+  while IFS= read -r entry_json; do
+    local localname pkg_type path source latest
+    localname=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['localname'])" "$entry_json")
+    pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry_json")
+    path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry_json")
+    source=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['source'])" "$entry_json")
+    latest=$(_fetch_latest_version "$pkg_type" "$path" "$source")
+    latest_map["$localname"]="${latest:-unknown}"
+  done <<< "$packages"
+
+  local outdated=0
+  local fmt='{:<20} {:<12} {:<12} {:<12} {:<10} {}'
+  python3 - <<PYEOF
+import json, sys
+data = json.load(open('$STATE_FILE'))
+fmt = '{:<20} {:<12} {:<12} {:<12} {:<10} {}'
+print(fmt.format('NAME', 'LOCALNAME', 'INSTALLED', 'LATEST', 'TYPE', 'PATH'))
+print('-' * 96)
+latest_map = {}
+PYEOF
+
+  while IFS= read -r entry_json; do
+    local localname installed latest pkg_type path
+    localname=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['localname'])" "$entry_json")
+    installed=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$entry_json")
+    pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry_json")
+    path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry_json")
+    latest="${latest_map[$localname]:-unknown}"
+    local marker=""
+    if [ "$latest" != "unknown" ] && [ "$installed" != "unknown" ] && [ "$latest" != "$installed" ]; then
+      marker=" *"
+      outdated=1
+    fi
+    printf '%-20s %-12s %-12s %-12s %-10s %s%s\n' \
+      "$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['name'])" "$entry_json")" \
+      "$localname" "$installed" "$latest$marker" "$pkg_type" "$path"
+  done <<< "$packages"
+
+  if [ "$outdated" -eq 1 ]; then
+    echo ""
+    echo "You have one or more outdated packages. You can update them by running \`kbpkg update\`."
+  fi
 }
 
 cmd_remove() {
@@ -588,10 +764,12 @@ cmd_clean() {
 import json, os
 data = json.load(open('$STATE_FILE'))
 before = len(data['packages'])
-data['packages'] = [
-    p for p in data['packages']
-    if os.path.isdir(os.path.join(p['path'], '.git'))
-]
+def is_valid(p):
+    pkg_type = p.get('type', 'web')
+    if pkg_type == 'binary':
+        return os.path.isfile(p['path'])
+    return os.path.isdir(os.path.join(p['path'], '.git'))
+data['packages'] = [p for p in data['packages'] if is_valid(p)]
 after = len(data['packages'])
 json.dump(data, open('$STATE_FILE','w'), indent=2)
 removed = before - after

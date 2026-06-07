@@ -721,64 +721,65 @@ _fetch_latest_version() {
 cmd_list() {
   _check_version
 
-  local packages
-  packages=$(python3 -c "
-import json
+  local pkgs
+  pkgs=$(python3 -c "
+import json, sys
 data = json.load(open('$STATE_FILE'))
-import json as j
+if not data['packages']:
+    sys.exit(1)
 for p in data['packages']:
-    print(j.dumps(p))
-")
-
-  if [ -z "$packages" ]; then
+    print(p['localname'], p.get('type','web'), p['path'], p['source'])
+" 2>/dev/null)
+  if [ $? -ne 0 ]; then
     echo "No packages installed."
     return
   fi
 
-  local -A latest_map
   echo "Checking for updates..." >&2
-  while IFS= read -r entry_json; do
-    local localname pkg_type path source latest
-    localname=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['localname'])" "$entry_json")
-    pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry_json")
-    path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry_json")
-    source=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['source'])" "$entry_json")
-    latest=$(_fetch_latest_version "$pkg_type" "$path" "$source")
-    latest_map["$localname"]="${latest:-unknown}"
-  done <<< "$packages"
 
-  local outdated=0
-  local fmt='{:<20} {:<12} {:<12} {:<12} {:<10} {}'
-  python3 - <<PYEOF
+  # Build latest version map: localname=version pairs, newline-separated
+  local latest_pairs=""
+  while IFS=' ' read -r localname pkg_type path source; do
+    local latest
+    latest=$(_fetch_latest_version "$pkg_type" "$path" "$source")
+    latest_pairs+="$localname=${latest:-unknown}"$'\n'
+  done <<< "$pkgs"
+
+  python3 -c "
 import json, sys
-data = json.load(open('$STATE_FILE'))
-fmt = '{:<20} {:<12} {:<12} {:<12} {:<10} {}'
+
+state   = json.load(open('$STATE_FILE'))
+pkgs    = state['packages']
+
+# Parse latest_pairs passed via argv[1]: 'localname=version\n...'
+latest_map = {}
+for line in sys.argv[1].splitlines():
+    if '=' in line:
+        k, _, v = line.partition('=')
+        latest_map[k] = v
+
+fmt = '{:<20} {:<12} {:<12} {:<14} {:<10} {}'
 print(fmt.format('NAME', 'LOCALNAME', 'INSTALLED', 'LATEST', 'TYPE', 'PATH'))
 print('-' * 96)
-latest_map = {}
-PYEOF
 
-  while IFS= read -r entry_json; do
-    local localname installed latest pkg_type path
-    localname=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['localname'])" "$entry_json")
-    installed=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$entry_json")
-    pkg_type=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('type','web'))" "$entry_json")
-    path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['path'])" "$entry_json")
-    latest="${latest_map[$localname]:-unknown}"
-    local marker=""
-    if [ "$latest" != "unknown" ] && [ "$installed" != "unknown" ] && [ "$latest" != "$installed" ]; then
-      marker=" *"
-      outdated=1
-    fi
-    printf '%-20s %-12s %-12s %-12s %-10s %s%s\n' \
-      "$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['name'])" "$entry_json")" \
-      "$localname" "$installed" "$latest$marker" "$pkg_type" "$path"
-  done <<< "$packages"
+outdated = 0
+for p in pkgs:
+    name      = p['name']
+    localname = p['localname']
+    installed = p['version']
+    pkg_type  = p.get('type', 'web')
+    path      = p['path']
+    latest    = latest_map.get(localname, 'unknown')
+    marker    = ''
+    if latest not in ('unknown', '') and latest != installed:
+        marker   = ' *'
+        outdated = 1
+    print(fmt.format(name, localname, installed, latest + marker, pkg_type, path))
 
-  if [ "$outdated" -eq 1 ]; then
-    echo ""
-    echo "You have one or more outdated packages. You can update them by running \`kbpkg update\`."
-  fi
+if outdated:
+    print()
+    print(\"You have one or more outdated packages. Run \\\`kbpkg update\\\` to update.\")
+" "$latest_pairs"
 }
 
 cmd_remove() {
